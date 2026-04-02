@@ -12,6 +12,7 @@ pub struct AppState {
     pub config: Config,
     pub config_loaded: bool,
     pub unsaved_changes: bool,
+    pub audio_error: Option<String>,
 }
 
 impl AppState {
@@ -25,6 +26,7 @@ impl AppState {
             config,
             config_loaded,
             unsaved_changes: false,
+            audio_error: None,
         }
     }
 
@@ -61,5 +63,13 @@ impl AppState {
 
     pub fn mark_saved(&mut self) {
         self.unsaved_changes = false;
+    }
+
+    pub fn set_audio_error(&mut self, msg: String) {
+        self.audio_error = Some(msg);
+    }
+
+    pub fn clear_audio_error(&mut self) {
+        self.audio_error = None;
     }
 }

@@ -66,7 +66,7 @@ pub fn get_output_devices() -> Result<Vec<OutputDevice>, String> {
 }
 
 /// Helper to temporarily suppress stderr to hide ALSA warnings
-struct StderrGuard {
+pub(crate) struct StderrGuard {
     original_fd: i32,
 }
 

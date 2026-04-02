@@ -239,6 +239,15 @@ impl SettingsScreen {
                                     config.output_device = selected_device;
                                     state.mark_unsaved();
                                 }
+
+                                // Show audio error if present
+                                if let Some(ref error) = state.audio_error {
+                                    ui.add_space(4.0);
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(255, 100, 100),
+                                        error,
+                                    );
+                                }
                             });
                             ui.add_space(15.0);
 

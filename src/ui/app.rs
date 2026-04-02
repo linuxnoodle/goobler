@@ -34,11 +34,11 @@ impl GooblerApp {
         };
 
         // Create app state
-        let state = AppState::new(config, config_loaded);
+        let mut state = AppState::new(config, config_loaded);
 
         // Initialize audio engine
         let previous_output_device = state.config.audio.output_device.clone();
-        let audio_handle = Self::initialize_audio(&state.config);
+        let audio_handle = Self::initialize_audio(&mut state);
 
         Self {
             state,
@@ -50,25 +50,26 @@ impl GooblerApp {
         }
     }
 
-    fn initialize_audio(config: &Config) -> Option<AudioEngineHandle> {
+    fn initialize_audio(state: &mut AppState) -> Option<AudioEngineHandle> {
         use crate::audio::AudioEngine;
         use std::sync::Arc;
 
         // Get the device name as a string slice
-        let device_name = config.audio.output_device.as_deref();
+        let device_name = state.config.audio.output_device.as_deref();
 
-        match AudioEngine::with_device(config.audio.sample_rate, device_name) {
+        match AudioEngine::with_device(state.config.audio.sample_rate, device_name) {
             Ok(engine) => {
                 println!(
                     "Audio engine initialized successfully at {}Hz",
-                    config.audio.sample_rate
+                    state.config.audio.sample_rate
                 );
+                state.clear_audio_error();
                 let engine = Arc::new(Mutex::new(engine));
 
                 // Apply initial config
                 {
                     let mut eng = engine.lock().unwrap();
-                    eng.apply_config(&config.audio);
+                    eng.apply_config(&state.config.audio);
                     eng.play();
                 }
 
@@ -76,6 +77,7 @@ impl GooblerApp {
             }
             Err(e) => {
                 eprintln!("Failed to initialize audio engine: {}", e);
+                state.set_audio_error(e);
                 None
             }
         }
@@ -97,7 +99,7 @@ impl GooblerApp {
                 .unwrap_or(false);
 
             // Re-initialize audio (always starts playing)
-            self.audio_handle = Self::initialize_audio(&self.state.config);
+            self.audio_handle = Self::initialize_audio(&mut self.state);
 
             // initialize_audio always calls play(), so pause if it wasn't playing before
             if !was_playing {

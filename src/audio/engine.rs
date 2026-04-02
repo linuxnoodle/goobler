@@ -10,7 +10,6 @@ pub struct AudioEngine {
     _stream_handle: OutputStreamHandle,
     sink: Sink,
     processing_chain: Arc<Mutex<ProcessingChain>>,
-    sample_rate: u32,
 }
 
 impl AudioEngine {
@@ -18,39 +17,91 @@ impl AudioEngine {
         Self::with_device(sample_rate, None)
     }
 
-    pub fn with_device(sample_rate: u32, output_device: Option<&str>) -> Result<Self, String> {
-        let (stream, stream_handle) = if let Some(device_name) = output_device {
-            // Try to find and use specified device
-            let host = cpal::default_host();
-            let devices: Vec<_> = host
-                .output_devices()
-                .map_err(|e| format!("Failed to get output devices: {}", e))?
-                .collect();
-
-            let target_device = devices
-                .iter()
-                .find(|d| d.name().as_ref().ok().map(|n| n.as_str()) == Some(device_name))
-                .ok_or_else(|| format!("Device '{}' not found", device_name))?;
-
-            OutputStream::try_from_device(&target_device).map_err(|e| {
-                format!(
-                    "Failed to create output stream for device '{}': {}",
-                    device_name, e
-                )
-            })?
-        } else {
-            // Use default device
-            OutputStream::try_default()
-                .map_err(|e| format!("Failed to create default output stream: {}", e))?
+    /// Pick the best sample rate for a device.
+    /// Returns the configured rate if the device supports it, otherwise the device's default rate.
+    fn pick_sample_rate(device: &cpal::Device, configured_rate: u32) -> u32 {
+        let Ok(configs) = device.supported_output_configs() else {
+            return configured_rate;
         };
 
-        let processing_chain = Arc::new(Mutex::new(ProcessingChain::new(sample_rate)));
+        let mut best_match: Option<u32> = None;
+        let mut default_rate: Option<u32> = None;
+
+        for config in configs {
+            let rate = config.min_sample_rate().0;
+
+            // Prefer exact match (check full range)
+            if configured_rate >= config.min_sample_rate().0
+                && configured_rate <= config.max_sample_rate().0
+            {
+                return configured_rate;
+            }
+
+            // Track the first (default) config's rate as fallback
+            if default_rate.is_none() {
+                default_rate = Some(rate);
+            }
+
+            // Track closest rate as second fallback
+            if best_match.is_none()
+                || (rate as i32 - configured_rate as i32).abs()
+                    < (best_match.unwrap() as i32 - configured_rate as i32).abs()
+            {
+                best_match = Some(rate);
+            }
+        }
+
+        // Prefer the device's default config rate, then closest match, then configured rate
+        default_rate
+            .or(best_match)
+            .unwrap_or(configured_rate)
+    }
+
+    pub fn with_device(sample_rate: u32, output_device: Option<&str>) -> Result<Self, String> {
+        let _stderr_guard = crate::audio::StderrGuard::new();
+
+        let (stream, stream_handle, actual_sample_rate) =
+            if let Some(device_name) = output_device {
+                // Try to find and use specified device
+                let host = cpal::default_host();
+                let devices: Vec<_> = host
+                    .output_devices()
+                    .map_err(|e| format!("Failed to get output devices: {}", e))?
+                    .collect();
+
+                let target_device = devices
+                    .iter()
+                    .find(|d| d.name().as_ref().ok().map(|n| n.as_str()) == Some(device_name))
+                    .ok_or_else(|| format!("Device '{}' not found", device_name))?;
+
+                // Query device's supported sample rates and pick the best match
+                let device_rate = Self::pick_sample_rate(&target_device, sample_rate);
+
+                let (stream, handle) = OutputStream::try_from_device(&target_device).map_err(
+                    |e| {
+                        format!(
+                            "Failed to open device '{}': {}",
+                            device_name, e
+                        )
+                    },
+                )?;
+
+                (stream, handle, device_rate)
+            } else {
+                // Use default device — let rodio/cpal pick the format
+                let (stream, handle) = OutputStream::try_default()
+                    .map_err(|e| format!("Failed to create default output stream: {}", e))?;
+
+                (stream, handle, sample_rate)
+            };
+
+        let processing_chain = Arc::new(Mutex::new(ProcessingChain::new(actual_sample_rate)));
 
         let sink =
             Sink::try_new(&stream_handle).map_err(|e| format!("Failed to create sink: {}", e))?;
 
         // Create noise source
-        let noise_source = NoiseSource::new(Arc::clone(&processing_chain), sample_rate);
+        let noise_source = NoiseSource::new(Arc::clone(&processing_chain), actual_sample_rate);
 
         // Set source to loop indefinitely
         sink.append(noise_source.repeat_infinite());
@@ -64,7 +115,6 @@ impl AudioEngine {
             _stream_handle: stream_handle,
             sink,
             processing_chain,
-            sample_rate,
         })
     }
 
