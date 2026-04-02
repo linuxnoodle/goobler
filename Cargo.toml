@@ -1,0 +1,32 @@
+[package]
+name = "goobler"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name"]
+
+[features]
+default = []
+debug_audio = []
+debug_ui = []
+
+[dependencies]
+# GUI framework
+egui = "0.28"
+eframe = { version = "0.28", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "persistence",
+] }
+
+# Audio processing
+rodio = "0.19"
+cpal = "0.15"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Utilities
+dirs = "5.0"
+rand = "0.8"
+libc = "0.2"

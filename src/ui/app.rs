@@ -1,0 +1,182 @@
+use crate::audio::AudioEngineHandle;
+use crate::config::types::Config;
+use crate::config::{load_config, save_config};
+use crate::state::AppState;
+use crate::ui::screens::{BlankedScreen, SettingsScreen};
+use crate::ui::theme::setup_style;
+use eframe::egui;
+use std::sync::Mutex;
+
+pub struct GooblerApp {
+    state: AppState,
+    audio_handle: Option<AudioEngineHandle>,
+    blanked_screen: BlankedScreen,
+    settings_screen: SettingsScreen,
+    previous_output_device: Option<String>,
+    previous_cursor_visible: bool,
+}
+
+impl GooblerApp {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Apply custom theme
+        setup_style(&cc.egui_ctx);
+
+        // Load or create config
+        let (config, config_loaded) = match load_config() {
+            Some(loaded_config) => {
+                println!("Loaded config from disk");
+                (loaded_config, true)
+            }
+            None => {
+                println!("No config found, using defaults");
+                (Config::default(), false)
+            }
+        };
+
+        // Create app state
+        let state = AppState::new(config, config_loaded);
+
+        // Initialize audio engine
+        let previous_output_device = state.config.audio.output_device.clone();
+        let audio_handle = Self::initialize_audio(&state.config);
+
+        Self {
+            state,
+            audio_handle,
+            blanked_screen: BlankedScreen::new(),
+            settings_screen: SettingsScreen::new(true),
+            previous_output_device,
+            previous_cursor_visible: true,
+        }
+    }
+
+    fn initialize_audio(config: &Config) -> Option<AudioEngineHandle> {
+        use crate::audio::AudioEngine;
+        use std::sync::Arc;
+
+        // Get the device name as a string slice
+        let device_name = config.audio.output_device.as_deref();
+
+        match AudioEngine::with_device(config.audio.sample_rate, device_name) {
+            Ok(engine) => {
+                println!(
+                    "Audio engine initialized successfully at {}Hz",
+                    config.audio.sample_rate
+                );
+                let engine = Arc::new(Mutex::new(engine));
+
+                // Apply initial config
+                {
+                    let mut eng = engine.lock().unwrap();
+                    eng.apply_config(&config.audio);
+                    eng.play();
+                }
+
+                Some(AudioEngineHandle::new(engine))
+            }
+            Err(e) => {
+                eprintln!("Failed to initialize audio engine: {}", e);
+                None
+            }
+        }
+    }
+
+    fn update_audio_config(&mut self) {
+        // Check if output device has changed
+        let current_device = self.state.config.audio.output_device.clone();
+        if self.previous_output_device != current_device {
+            // Re-initialize audio engine with new device
+            println!("Output device changed, re-initializing audio engine...");
+            self.previous_output_device = current_device.clone();
+
+            // Store whether audio was playing
+            let was_playing = self
+                .audio_handle
+                .as_ref()
+                .map(|h| h.is_playing())
+                .unwrap_or(false);
+
+            // Re-initialize audio (always starts playing)
+            self.audio_handle = Self::initialize_audio(&self.state.config);
+
+            // initialize_audio always calls play(), so pause if it wasn't playing before
+            if !was_playing {
+                if let Some(handle) = &self.audio_handle {
+                    handle.pause();
+                }
+            }
+        } else if let Some(handle) = &self.audio_handle {
+            // Just update config if device hasn't changed
+            handle.apply_config(&self.state.config.audio);
+        }
+    }
+
+    fn switch_mode(&mut self) {
+        #[cfg(feature = "debug_ui")]
+        println!("switch_mode called, current mode: {:?}", self.state.mode);
+        match self.state.mode {
+            crate::state::AppMode::Blanked => {
+                self.state.switch_to_settings();
+                // Reset fullscreen flag when leaving blanked mode
+                self.blanked_screen.reset_fullscreen();
+            }
+            crate::state::AppMode::Settings => {
+                self.state.switch_to_blank();
+                // Ensure audio is playing when entering blanked mode
+                if let Some(handle) = &self.audio_handle {
+                    let is_playing = handle.is_playing();
+                    if !is_playing {
+                        handle.play();
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl eframe::App for GooblerApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Only send cursor visibility command when mode actually changes
+        let cursor_visible = matches!(self.state.mode, crate::state::AppMode::Settings);
+        if cursor_visible != self.previous_cursor_visible {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(cursor_visible));
+            self.previous_cursor_visible = cursor_visible;
+        }
+
+        // Handle mode switching
+        match self.state.mode {
+            crate::state::AppMode::Blanked => {
+                let should_switch = self.blanked_screen.show(ctx);
+                if should_switch {
+                    self.switch_mode();
+                }
+            }
+            crate::state::AppMode::Settings => {
+                let should_switch = self.settings_screen.show(ctx, &mut self.state);
+                // Update audio immediately when in settings mode for real-time feedback
+                self.update_audio_config();
+                if should_switch {
+                    self.switch_mode();
+                }
+            }
+        }
+
+        // Only request repaint when in settings mode
+        // In blanked mode, we don't need continuous repaints since nothing changes
+        // This significantly reduces CPU usage when just playing noise
+        if matches!(self.state.mode, crate::state::AppMode::Settings) {
+            ctx.request_repaint();
+        }
+    }
+
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        // Only save config if there are unsaved changes
+        if self.state.unsaved_changes {
+            if let Err(e) = save_config(&self.state.config) {
+                eprintln!("Failed to save config on exit: {}", e);
+            } else {
+                println!("Config saved on exit");
+            }
+        }
+    }
+}
