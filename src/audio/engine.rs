@@ -1,15 +1,13 @@
 use crate::audio::processor::ProcessingChain;
 use crate::config::{AudioConfig, NoiseType};
-use cpal::traits::{DeviceTrait, HostTrait};
-use rodio::{OutputStream, OutputStreamHandle, Sink, Source};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 pub struct AudioEngine {
-    _stream: OutputStream,
-    _stream_handle: OutputStreamHandle,
-    sink: Sink,
+    _stream: cpal::Stream,
     processing_chain: Arc<Mutex<ProcessingChain>>,
+    paused: Arc<AtomicBool>,
 }
 
 impl AudioEngine {
@@ -57,64 +55,123 @@ impl AudioEngine {
             .unwrap_or(configured_rate)
     }
 
+    /// Find a supported stream config range that uses f32 sample format with stereo channels.
+    fn find_supported_config_range(
+        device: &cpal::Device,
+    ) -> Result<cpal::SupportedStreamConfigRange, String> {
+        let configs: Vec<_> = device
+            .supported_output_configs()
+            .map_err(|e| format!("Failed to query device configs: {}", e))?
+            .collect();
+
+        // Prefer f32 stereo configs
+        if let Some(config) = configs.iter().find(|c| {
+            c.sample_format() == cpal::SampleFormat::F32 && c.channels() == 2
+        }) {
+            return Ok(config.clone());
+        }
+
+        // Fall back to f32 with any channel count
+        if let Some(config) = configs
+            .iter()
+            .find(|c| c.sample_format() == cpal::SampleFormat::F32)
+        {
+            return Ok(config.clone());
+        }
+
+        // Fall back to default config range
+        Err("No f32 config found".to_string())
+    }
+
     pub fn with_device(sample_rate: u32, output_device: Option<&str>) -> Result<Self, String> {
         let _stderr_guard = crate::audio::StderrGuard::new();
 
-        let (stream, stream_handle, actual_sample_rate) =
-            if let Some(device_name) = output_device {
-                // Try to find and use specified device
-                let host = cpal::default_host();
-                let devices: Vec<_> = host
-                    .output_devices()
-                    .map_err(|e| format!("Failed to get output devices: {}", e))?
-                    .collect();
+        let (device, device_name) = if let Some(name) = output_device {
+            let host = cpal::default_host();
+            let devices: Vec<_> = host
+                .output_devices()
+                .map_err(|e| format!("Failed to get output devices: {}", e))?
+                .collect();
 
-                let target_device = devices
-                    .iter()
-                    .find(|d| d.name().as_ref().ok().map(|n| n.as_str()) == Some(device_name))
-                    .ok_or_else(|| format!("Device '{}' not found", device_name))?;
+            let target = devices
+                .iter()
+                .find(|d| d.name().as_ref().ok().map(|n| n.as_str()) == Some(name))
+                .ok_or_else(|| format!("Device '{}' not found", name))?;
 
-                // Query device's supported sample rates and pick the best match
-                let device_rate = Self::pick_sample_rate(&target_device, sample_rate);
+            (target.clone(), name.to_string())
+        } else {
+            let host = cpal::default_host();
+            let dev = host
+                .default_output_device()
+                .ok_or("No default output device")?;
+            let name = dev.name().unwrap_or_default();
+            (dev, name)
+        };
 
-                let (stream, handle) = OutputStream::try_from_device(&target_device).map_err(
-                    |e| {
-                        format!(
-                            "Failed to open device '{}': {}",
-                            device_name, e
-                        )
-                    },
-                )?;
+        let actual_rate = Self::pick_sample_rate(&device, sample_rate);
 
-                (stream, handle, device_rate)
-            } else {
-                // Use default device — let rodio/cpal pick the format
-                let (stream, handle) = OutputStream::try_default()
-                    .map_err(|e| format!("Failed to create default output stream: {}", e))?;
+        let supported_config_range = Self::find_supported_config_range(&device)?;
+        let config: cpal::StreamConfig = supported_config_range
+            .with_sample_rate(cpal::SampleRate(actual_rate))
+            .into();
 
-                (stream, handle, sample_rate)
-            };
+        let processing_chain = Arc::new(Mutex::new(ProcessingChain::new(actual_rate)));
+        let paused = Arc::new(AtomicBool::new(true)); // Start paused
 
-        let processing_chain = Arc::new(Mutex::new(ProcessingChain::new(actual_sample_rate)));
+        let chain_ref = Arc::clone(&processing_chain);
+        let paused_ref = Arc::clone(&paused);
+        let channels = config.channels;
 
-        let sink =
-            Sink::try_new(&stream_handle).map_err(|e| format!("Failed to create sink: {}", e))?;
+        let stream = device
+            .build_output_stream::<f32, _, _>(
+                &config,
+                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    if paused_ref.load(Ordering::Relaxed) {
+                        for sample in data.iter_mut() {
+                            *sample = 0.0;
+                        }
+                        return;
+                    }
 
-        // Create noise source
-        let noise_source = NoiseSource::new(Arc::clone(&processing_chain), actual_sample_rate);
+                    if let Ok(mut chain) = chain_ref.lock() {
+                        if channels == 2 {
+                            for chunk in data.chunks_exact_mut(2) {
+                                let (smoothing, overlay, _, overlay_amount) =
+                                    chain.get_smoothing_config();
+                                let (left, right) =
+                                    chain.process_stereo(smoothing, overlay, overlay_amount);
+                                chunk[0] = left;
+                                chunk[1] = right;
+                            }
+                        } else {
+                            // Mono or other channel counts: generate stereo, take first channel
+                            for sample in data.iter_mut() {
+                                let (smoothing, overlay, _, overlay_amount) =
+                                    chain.get_smoothing_config();
+                                let (left, _) =
+                                    chain.process_stereo(smoothing, overlay, overlay_amount);
+                                *sample = left;
+                            }
+                        }
+                    } else {
+                        for sample in data.iter_mut() {
+                            *sample = 0.0;
+                        }
+                    }
+                },
+                move |err| {
+                    eprintln!("Audio output error on '{}': {}", device_name, err);
+                },
+                None,
+            )
+            .map_err(|e| format!("Failed to build output stream: {}", e))?;
 
-        // Set source to loop indefinitely
-        sink.append(noise_source.repeat_infinite());
-        sink.set_volume(1.0);
-
-        // Pause audio immediately to prevent startup noise with default settings
-        sink.pause();
+        stream.play().map_err(|e| format!("Failed to start output stream: {}", e))?;
 
         Ok(Self {
             _stream: stream,
-            _stream_handle: stream_handle,
-            sink,
             processing_chain,
+            paused,
         })
     }
 
@@ -173,26 +230,22 @@ impl AudioEngine {
     pub fn play(&self) {
         #[cfg(feature = "debug_audio")]
         println!("AudioEngine::play() called");
-        self.sink.play();
+        self.paused.store(false, Ordering::Relaxed);
     }
 
     pub fn pause(&self) {
         #[cfg(feature = "debug_audio")]
         println!("AudioEngine::pause() called");
-        self.sink.pause();
+        self.paused.store(true, Ordering::Relaxed);
     }
 
     pub fn is_playing(&self) -> bool {
-        !self.sink.is_paused()
+        !self.paused.load(Ordering::Relaxed)
     }
 
     pub fn toggle(&self) {
-        let was_paused = self.sink.is_paused();
-        if was_paused {
-            self.sink.play();
-        } else {
-            self.sink.pause();
-        }
+        let was_paused = self.paused.load(Ordering::Relaxed);
+        self.paused.store(!was_paused, Ordering::Relaxed);
     }
 }
 
@@ -275,111 +328,5 @@ impl AudioEngineHandle {
         } else {
             false
         }
-    }
-}
-
-// Cached config to avoid locking every sample
-#[derive(Clone, Copy)]
-struct CachedConfig {
-    smoothing_enabled: bool,
-    overlay_enabled: bool,
-    overlay_amount: f32,
-}
-
-impl CachedConfig {
-    fn new() -> Self {
-        Self {
-            smoothing_enabled: false,
-            overlay_enabled: false,
-            overlay_amount: 0.3,
-        }
-    }
-}
-
-// Custom source that generates noise from the processing chain
-struct NoiseSource {
-    processing_chain: Arc<Mutex<ProcessingChain>>,
-    sample_rate: u32,
-    left_sample: Option<f32>,
-    cached_config: CachedConfig,
-    samples_since_last_update: u32,
-    config_update_interval: u32,
-}
-
-impl NoiseSource {
-    fn new(processing_chain: Arc<Mutex<ProcessingChain>>, sample_rate: u32) -> Self {
-        Self {
-            processing_chain,
-            sample_rate,
-            left_sample: None,
-            cached_config: CachedConfig::new(),
-            samples_since_last_update: 0,
-            config_update_interval: 256, // Update config every 256 samples (~2.7ms at 48kHz)
-        }
-    }
-
-    fn update_cached_config(&mut self) {
-        if let Ok(chain) = self.processing_chain.lock() {
-            let (smoothing, overlay, _, overlay_amount) = chain.get_smoothing_config();
-            self.cached_config = CachedConfig {
-                smoothing_enabled: smoothing,
-                overlay_enabled: overlay,
-                overlay_amount,
-            };
-        }
-    }
-}
-
-impl Iterator for NoiseSource {
-    type Item = f32;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // If we have a left sample cached, return it and cache the right
-        if let Some(cached) = self.left_sample.take() {
-            return Some(cached);
-        }
-
-        // Update cached config periodically to reduce lock frequency
-        self.samples_since_last_update += 1;
-        if self.samples_since_last_update >= self.config_update_interval {
-            self.update_cached_config();
-            self.samples_since_last_update = 0;
-        }
-
-        // Generate a new stereo pair
-        // Lock only for processing, not for config reading
-        let (left, right) = if let Ok(mut chain) = self.processing_chain.lock() {
-            chain.process_stereo(
-                self.cached_config.smoothing_enabled,
-                self.cached_config.overlay_enabled,
-                self.cached_config.overlay_amount,
-            )
-        } else {
-            // If lock fails, return silence
-            (0.0, 0.0)
-        };
-
-        // Cache the right sample and return the left
-        self.left_sample = Some(right);
-
-        Some(left)
-    }
-}
-
-impl Source for NoiseSource {
-    fn current_frame_len(&self) -> Option<usize> {
-        None
-    }
-
-    fn channels(&self) -> u16 {
-        2 // Stereo
-    }
-
-    fn sample_rate(&self) -> u32 {
-        self.sample_rate
-    }
-
-    fn total_duration(&self) -> Option<Duration> {
-        None
     }
 }

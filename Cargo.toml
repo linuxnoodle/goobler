@@ -19,7 +19,6 @@ eframe = { version = "0.28", default-features = false, features = [
 ] }
 
 # Audio processing
-rodio = "0.19"
 cpal = "0.15"
 
 # Serialization
