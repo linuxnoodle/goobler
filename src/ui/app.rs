@@ -138,11 +138,20 @@ impl GooblerApp {
 
 impl eframe::App for GooblerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Only send cursor visibility command when mode actually changes
-        let cursor_visible = matches!(self.state.mode, crate::state::AppMode::Settings);
-        if cursor_visible != self.previous_cursor_visible {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(cursor_visible));
-            self.previous_cursor_visible = cursor_visible;
+        // In blanked mode, continuously re-send cursor hidden to prevent
+        // the compositor or fullscreen transition from restoring it.
+        // In settings mode, only send on transition (cursor should be visible).
+        match self.state.mode {
+            crate::state::AppMode::Blanked => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
+                self.previous_cursor_visible = false;
+            }
+            crate::state::AppMode::Settings => {
+                if !self.previous_cursor_visible {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
+                    self.previous_cursor_visible = true;
+                }
+            }
         }
 
         // Handle mode switching
@@ -163,11 +172,13 @@ impl eframe::App for GooblerApp {
             }
         }
 
-        // Only request repaint when in settings mode
-        // In blanked mode, we don't need continuous repaints since nothing changes
-        // This significantly reduces CPU usage when just playing noise
+        // In settings mode, repaint continuously for real-time slider feedback.
+        // In blanked mode, repaint at a low rate to keep processing input events
+        // (ESC key, mouse movement) while minimizing CPU usage.
         if matches!(self.state.mode, crate::state::AppMode::Settings) {
             ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
 

@@ -55,34 +55,6 @@ impl AudioEngine {
             .unwrap_or(configured_rate)
     }
 
-    /// Find a supported stream config range that uses f32 sample format with stereo channels.
-    fn find_supported_config_range(
-        device: &cpal::Device,
-    ) -> Result<cpal::SupportedStreamConfigRange, String> {
-        let configs: Vec<_> = device
-            .supported_output_configs()
-            .map_err(|e| format!("Failed to query device configs: {}", e))?
-            .collect();
-
-        // Prefer f32 stereo configs
-        if let Some(config) = configs.iter().find(|c| {
-            c.sample_format() == cpal::SampleFormat::F32 && c.channels() == 2
-        }) {
-            return Ok(config.clone());
-        }
-
-        // Fall back to f32 with any channel count
-        if let Some(config) = configs
-            .iter()
-            .find(|c| c.sample_format() == cpal::SampleFormat::F32)
-        {
-            return Ok(config.clone());
-        }
-
-        // Fall back to default config range
-        Err("No f32 config found".to_string())
-    }
-
     pub fn with_device(sample_rate: u32, output_device: Option<&str>) -> Result<Self, String> {
         let _stderr_guard = crate::audio::StderrGuard::new();
 
@@ -110,62 +82,55 @@ impl AudioEngine {
 
         let actual_rate = Self::pick_sample_rate(&device, sample_rate);
 
-        let supported_config_range = Self::find_supported_config_range(&device)?;
-        let config: cpal::StreamConfig = supported_config_range
-            .with_sample_rate(cpal::SampleRate(actual_rate))
-            .into();
+        // Use the device's default supported config (handles format, channels, etc.)
+        // then override the sample rate to our chosen rate
+        let default_config = device
+            .default_output_config()
+            .map_err(|e| format!("Failed to get default output config: {}", e))?;
+        let sample_format = default_config.sample_format();
+        let channels = default_config.channels();
+
+        let config: cpal::StreamConfig = cpal::StreamConfig {
+            channels,
+            sample_rate: cpal::SampleRate(actual_rate),
+            buffer_size: cpal::BufferSize::Default,
+        };
 
         let processing_chain = Arc::new(Mutex::new(ProcessingChain::new(actual_rate)));
         let paused = Arc::new(AtomicBool::new(true)); // Start paused
 
         let chain_ref = Arc::clone(&processing_chain);
         let paused_ref = Arc::clone(&paused);
-        let channels = config.channels;
 
-        let stream = device
-            .build_output_stream::<f32, _, _>(
+        // Build the stream using a macro to handle different sample formats
+        let stream_result = match sample_format {
+            cpal::SampleFormat::F32 => device.build_output_stream::<f32, _, _>(
                 &config,
-                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    if paused_ref.load(Ordering::Relaxed) {
-                        for sample in data.iter_mut() {
-                            *sample = 0.0;
-                        }
-                        return;
-                    }
-
-                    if let Ok(mut chain) = chain_ref.lock() {
-                        if channels == 2 {
-                            for chunk in data.chunks_exact_mut(2) {
-                                let (smoothing, overlay, _, overlay_amount) =
-                                    chain.get_smoothing_config();
-                                let (left, right) =
-                                    chain.process_stereo(smoothing, overlay, overlay_amount);
-                                chunk[0] = left;
-                                chunk[1] = right;
-                            }
-                        } else {
-                            // Mono or other channel counts: generate stereo, take first channel
-                            for sample in data.iter_mut() {
-                                let (smoothing, overlay, _, overlay_amount) =
-                                    chain.get_smoothing_config();
-                                let (left, _) =
-                                    chain.process_stereo(smoothing, overlay, overlay_amount);
-                                *sample = left;
-                            }
-                        }
-                    } else {
-                        for sample in data.iter_mut() {
-                            *sample = 0.0;
-                        }
-                    }
-                },
-                move |err| {
-                    eprintln!("Audio output error on '{}': {}", device_name, err);
-                },
+                make_callback::<f32>(chain_ref, paused_ref, channels),
+                make_error_callback(device_name.clone()),
                 None,
-            )
-            .map_err(|e| format!("Failed to build output stream: {}", e))?;
+            ),
+            cpal::SampleFormat::I16 => device.build_output_stream::<i16, _, _>(
+                &config,
+                make_callback::<i16>(chain_ref, paused_ref, channels),
+                make_error_callback(device_name.clone()),
+                None,
+            ),
+            cpal::SampleFormat::U16 => device.build_output_stream::<u16, _, _>(
+                &config,
+                make_callback::<u16>(chain_ref, paused_ref, channels),
+                make_error_callback(device_name.clone()),
+                None,
+            ),
+            _ => {
+                return Err(format!(
+                    "Unsupported sample format '{:?}' on device '{}'",
+                    sample_format, device_name
+                ))
+            }
+        };
 
+        let stream = stream_result.map_err(|e| format!("Failed to build output stream: {}", e))?;
         stream.play().map_err(|e| format!("Failed to start output stream: {}", e))?;
 
         Ok(Self {
@@ -328,5 +293,53 @@ impl AudioEngineHandle {
         } else {
             false
         }
+    }
+}
+
+/// Build the audio data callback for a given sample format.
+fn make_callback<T>(
+    chain: Arc<Mutex<ProcessingChain>>,
+    paused: Arc<AtomicBool>,
+    channels: u16,
+) -> impl FnMut(&mut [T], &cpal::OutputCallbackInfo) + Send
+where
+    T: cpal::Sample + cpal::FromSample<f32>,
+{
+    move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+        if paused.load(Ordering::Relaxed) {
+            for sample in data.iter_mut() {
+                *sample = T::from_sample(0.0);
+            }
+            return;
+        }
+
+        if let Ok(mut chain) = chain.lock() {
+            if channels == 2 {
+                for chunk in data.chunks_exact_mut(2) {
+                    let (smoothing, overlay, _, overlay_amount) = chain.get_smoothing_config();
+                    let (left, right) = chain.process_stereo(smoothing, overlay, overlay_amount);
+                    chunk[0] = T::from_sample(left);
+                    chunk[1] = T::from_sample(right);
+                }
+            } else {
+                for sample in data.iter_mut() {
+                    let (smoothing, overlay, _, overlay_amount) = chain.get_smoothing_config();
+                    let (left, _) = chain.process_stereo(smoothing, overlay, overlay_amount);
+                    *sample = T::from_sample(left);
+                }
+            }
+        } else {
+            for sample in data.iter_mut() {
+                *sample = T::from_sample(0.0);
+            }
+        }
+    }
+}
+
+fn make_error_callback(
+    device_name: String,
+) -> impl FnMut(cpal::StreamError) + Send {
+    move |err| {
+        eprintln!("Audio output error on '{}': {}", device_name, err);
     }
 }
